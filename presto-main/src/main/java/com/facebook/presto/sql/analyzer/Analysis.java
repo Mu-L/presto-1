@@ -18,6 +18,7 @@ import com.facebook.presto.common.QualifiedObjectName;
 import com.facebook.presto.common.type.Type;
 import com.facebook.presto.security.AccessControl;
 import com.facebook.presto.spi.ColumnHandle;
+import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableHandle;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.security.Identity;
@@ -31,6 +32,7 @@ import com.facebook.presto.sql.tree.Join;
 import com.facebook.presto.sql.tree.LambdaArgumentDeclaration;
 import com.facebook.presto.sql.tree.Node;
 import com.facebook.presto.sql.tree.NodeRef;
+import com.facebook.presto.sql.tree.Offset;
 import com.facebook.presto.sql.tree.OrderBy;
 import com.facebook.presto.sql.tree.QuantifiedComparisonExpression;
 import com.facebook.presto.sql.tree.Query;
@@ -42,7 +44,6 @@ import com.facebook.presto.sql.tree.SubqueryExpression;
 import com.facebook.presto.sql.tree.Table;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableListMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ListMultimap;
 import com.google.common.collect.Multimap;
@@ -53,6 +54,7 @@ import javax.annotation.concurrent.Immutable;
 import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -63,10 +65,16 @@ import java.util.Optional;
 import java.util.Set;
 
 import static com.facebook.presto.SystemSessionProperties.isCheckAccessControlOnUtilizedColumnsOnly;
+import static com.facebook.presto.metadata.MetadataUtil.toSchemaTableName;
+import static com.facebook.presto.sql.analyzer.Analysis.MaterializedViewAnalysisState.NOT_VISITED;
+import static com.facebook.presto.sql.analyzer.Analysis.MaterializedViewAnalysisState.VISITED;
+import static com.facebook.presto.sql.analyzer.Analysis.MaterializedViewAnalysisState.VISITING;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static com.google.common.collect.Multimaps.forMap;
+import static com.google.common.collect.Multimaps.unmodifiableMultimap;
 import static java.lang.String.format;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.unmodifiableCollection;
@@ -103,6 +111,7 @@ public class Analysis
     private final Map<NodeRef<Node>, List<Expression>> outputExpressions = new LinkedHashMap<>();
     private final Map<NodeRef<QuerySpecification>, List<FunctionCall>> windowFunctions = new LinkedHashMap<>();
     private final Map<NodeRef<OrderBy>, List<FunctionCall>> orderByWindowFunctions = new LinkedHashMap<>();
+    private final Map<NodeRef<Offset>, Long> offset = new LinkedHashMap<>();
 
     private final Map<NodeRef<Join>, Expression> joins = new LinkedHashMap<>();
     private final Map<NodeRef<Join>, JoinUsingAnalysis> joinUsing = new LinkedHashMap<>();
@@ -136,6 +145,7 @@ public class Analysis
     private Optional<String> createTableComment = Optional.empty();
 
     private Optional<Insert> insert = Optional.empty();
+    private Optional<RefreshMaterializedViewAnalysis> refreshMaterializedViewAnalysis = Optional.empty();
     private Optional<TableHandle> analyzeTarget = Optional.empty();
 
     // for describe input and describe output
@@ -143,6 +153,12 @@ public class Analysis
 
     // for recursive view detection
     private final Deque<Table> tablesForView = new ArrayDeque<>();
+
+    // To prevent recursive analyzing of one materialized view base table
+    private final ListMultimap<NodeRef<Table>, Table> tablesForMaterializedView = ArrayListMultimap.create();
+
+    // for materialized view analysis state detection, state is used to identify if materialized view has been expanded or in-process.
+    private final Map<Table, MaterializedViewAnalysisState> materializedViewAnalysisStateMap = new HashMap<>();
 
     public Analysis(@Nullable Statement root, List<Expression> parameters, boolean isDescribe)
     {
@@ -322,6 +338,17 @@ public class Analysis
         return orderByExpressions.get(NodeRef.of(node));
     }
 
+    public void setOffset(Offset node, long rowCount)
+    {
+        offset.put(NodeRef.of(node), rowCount);
+    }
+
+    public long getOffset(Offset node)
+    {
+        checkState(offset.containsKey(NodeRef.of(node)), "missing OFFSET value for node %s", node);
+        return offset.get(NodeRef.of(node));
+    }
+
     public void setOutputExpressions(Node node, List<Expression> expressions)
     {
         outputExpressions.put(NodeRef.of(node), ImmutableList.copyOf(expressions));
@@ -463,6 +490,11 @@ public class Analysis
         return unmodifiableCollection(tables.values());
     }
 
+    public List<Table> getTableNodes()
+    {
+        return tables.keySet().stream().map(NodeRef::getNode).collect(toImmutableList());
+    }
+
     public void registerTable(Table table, TableHandle handle)
     {
         tables.put(NodeRef.of(table), handle);
@@ -490,7 +522,7 @@ public class Analysis
 
     public Multimap<NodeRef<Expression>, FieldId> getColumnReferenceFields()
     {
-        return ImmutableListMultimap.copyOf(columnReferences);
+        return unmodifiableMultimap(columnReferences);
     }
 
     public boolean isColumnReference(Expression expression)
@@ -594,6 +626,16 @@ public class Analysis
         return insert;
     }
 
+    public void setRefreshMaterializedViewAnalysis(RefreshMaterializedViewAnalysis refreshMaterializedViewAnalysis)
+    {
+        this.refreshMaterializedViewAnalysis = Optional.of(refreshMaterializedViewAnalysis);
+    }
+
+    public Optional<RefreshMaterializedViewAnalysis> getRefreshMaterializedViewAnalysis()
+    {
+        return refreshMaterializedViewAnalysis;
+    }
+
     public Query getNamedQuery(Table table)
     {
         return namedQueries.get(NodeRef.of(table));
@@ -617,9 +659,59 @@ public class Analysis
         tablesForView.pop();
     }
 
+    public void registerMaterializedViewForAnalysis(Table materializedView)
+    {
+        requireNonNull(materializedView, "materializedView is null");
+        if (materializedViewAnalysisStateMap.containsKey(materializedView)) {
+            materializedViewAnalysisStateMap.put(materializedView, VISITED);
+        }
+        else {
+            materializedViewAnalysisStateMap.put(materializedView, VISITING);
+        }
+    }
+
+    public void unregisterMaterializedViewForAnalysis(Table materializedView)
+    {
+        requireNonNull(materializedView, "materializedView is null");
+        checkState(
+                materializedViewAnalysisStateMap.containsKey(materializedView),
+                format("materializedViewAnalysisStateMap does not contain materialized view : %s", materializedView.getName()));
+        materializedViewAnalysisStateMap.remove(materializedView);
+    }
+
+    public MaterializedViewAnalysisState getMaterializedViewAnalysisState(Table materializedView)
+    {
+        requireNonNull(materializedView, "materializedView is null");
+        return materializedViewAnalysisStateMap.getOrDefault(materializedView, NOT_VISITED);
+    }
+
     public boolean hasTableInView(Table tableReference)
     {
         return tablesForView.contains(tableReference);
+    }
+
+    public void registerTableForMaterializedView(Table view, Table table)
+    {
+        requireNonNull(view, "view is null");
+        requireNonNull(table, "table is null");
+
+        tablesForMaterializedView.put(NodeRef.of(view), table);
+    }
+
+    public void unregisterTableForMaterializedView(Table view, Table table)
+    {
+        requireNonNull(view, "view is null");
+        requireNonNull(table, "table is null");
+
+        tablesForMaterializedView.remove(NodeRef.of(view), table);
+    }
+
+    public boolean hasTableRegisteredForMaterializedView(Table view, Table table)
+    {
+        requireNonNull(view, "view is null");
+        requireNonNull(table, "table is null");
+
+        return tablesForMaterializedView.containsEntry(NodeRef.of(view), table);
     }
 
     public void setSampleRatio(SampledRelation relation, double ratio)
@@ -709,6 +801,15 @@ public class Analysis
         return redundantOrderBy.contains(NodeRef.of(orderBy));
     }
 
+    public Map<String, Map<SchemaTableName, String>> getOriginalColumnMapping(Node node)
+    {
+        return getOutputDescriptor(node).getVisibleFields().stream()
+                .filter(field -> field.getOriginTable().isPresent() && field.getOriginColumnName().isPresent())
+                .collect(toImmutableMap(
+                        field -> field.getName().get(),
+                        field -> ImmutableMap.of(toSchemaTableName(field.getOriginTable().get()), field.getOriginColumnName().get())));
+    }
+
     @Immutable
     public static final class Insert
     {
@@ -730,6 +831,37 @@ public class Analysis
         public TableHandle getTarget()
         {
             return target;
+        }
+    }
+
+    @Immutable
+    public static final class RefreshMaterializedViewAnalysis
+    {
+        private final TableHandle target;
+        private final List<ColumnHandle> columns;
+        private final Query query;
+
+        public RefreshMaterializedViewAnalysis(TableHandle target, List<ColumnHandle> columns, Query query)
+        {
+            this.target = requireNonNull(target, "target is null");
+            this.columns = requireNonNull(columns, "columns is null");
+            this.query = requireNonNull(query, "query is null");
+            checkArgument(columns.size() > 0, "No columns given to insert");
+        }
+
+        public List<ColumnHandle> getColumns()
+        {
+            return columns;
+        }
+
+        public TableHandle getTarget()
+        {
+            return target;
+        }
+
+        public Query getQuery()
+        {
+            return query;
         }
     }
 
@@ -808,6 +940,35 @@ public class Analysis
         public List<Expression> getComplexExpressions()
         {
             return complexExpressions;
+        }
+    }
+
+    public enum MaterializedViewAnalysisState
+    {
+        NOT_VISITED(0),
+        VISITING(1),
+        VISITED(2);
+
+        private final int value;
+
+        MaterializedViewAnalysisState(int value)
+        {
+            this.value = value;
+        }
+
+        public boolean isNotVisited()
+        {
+            return this.value == NOT_VISITED.value;
+        }
+
+        public boolean isVisited()
+        {
+            return this.value == VISITED.value;
+        }
+
+        public boolean isVisiting()
+        {
+            return this.value == VISITING.value;
         }
     }
 

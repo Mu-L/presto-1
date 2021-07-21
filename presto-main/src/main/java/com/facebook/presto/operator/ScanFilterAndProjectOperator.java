@@ -36,6 +36,7 @@ import com.facebook.presto.spi.plan.PlanNodeId;
 import com.facebook.presto.split.EmptySplit;
 import com.facebook.presto.split.EmptySplitPageSource;
 import com.facebook.presto.split.PageSourceProvider;
+import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.SettableFuture;
@@ -138,7 +139,7 @@ public class ScanFilterAndProjectOperator
 
         Object splitInfo = split.getInfo();
         if (splitInfo != null) {
-            operatorContext.setInfoSupplier(() -> new SplitOperatorInfo(splitInfo));
+            operatorContext.setInfoSupplier(Suppliers.ofInstance(new SplitOperatorInfo(splitInfo)));
         }
         blocked.set(null);
 
@@ -313,8 +314,7 @@ public class ScanFilterAndProjectOperator
             Block loadedBlock = delegateLazyBlock.getLoadedBlock();
             delegateLazyBlock = null;
             // Position count already recorded for lazy blocks, input bytes are not
-            operatorContext.recordProcessedInput(loadedBlock.getSizeInBytes(), 0);
-            recordPageSourceRawInputStats();
+            recordInputStats();
             block.setBlock(loadedBlock);
         }
     }
@@ -331,13 +331,16 @@ public class ScanFilterAndProjectOperator
         readTimeNanos = endReadTimeNanos;
     }
 
-    private void recordPageSourceRawInputStats()
+    private void recordInputStats()
     {
         checkState(pageSource != null, "pageSource is null");
         long endCompletedBytes = pageSource.getCompletedBytes();
         long endCompletedPositions = pageSource.getCompletedPositions();
         long endReadTimeNanos = pageSource.getReadTimeNanos();
-        operatorContext.recordRawInputWithTiming(endCompletedBytes - completedBytes, endCompletedPositions - completedPositions, endReadTimeNanos - readTimeNanos);
+        long inputBytes = endCompletedBytes - completedBytes;
+        long positionCount = endCompletedPositions - completedPositions;
+        operatorContext.recordProcessedInput(inputBytes, positionCount);
+        operatorContext.recordRawInputWithTiming(inputBytes, positionCount, endReadTimeNanos - readTimeNanos);
         completedBytes = endCompletedBytes;
         completedPositions = endCompletedPositions;
         readTimeNanos = endReadTimeNanos;
@@ -361,8 +364,7 @@ public class ScanFilterAndProjectOperator
             }
         }
         // stats update
-        operatorContext.recordProcessedInput(blockSizeSum, page.getPositionCount());
-        recordPageSourceRawInputStats();
+        recordInputStats();
 
         return (blocks == null) ? page : new Page(page.getPositionCount(), blocks);
     }

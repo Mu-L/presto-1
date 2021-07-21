@@ -13,7 +13,6 @@
  */
 package com.facebook.presto.orc;
 
-import com.facebook.hive.orc.OrcConf;
 import com.facebook.hive.orc.lazy.OrcLazyObject;
 import com.facebook.presto.common.Page;
 import com.facebook.presto.common.Subfield;
@@ -45,6 +44,11 @@ import com.facebook.presto.orc.TupleDomainFilter.DoubleRange;
 import com.facebook.presto.orc.cache.OrcFileTailSource;
 import com.facebook.presto.orc.cache.StorageOrcFileTailSource;
 import com.facebook.presto.orc.metadata.CompressionKind;
+import com.facebook.presto.orc.metadata.Footer;
+import com.facebook.presto.orc.metadata.StripeFooter;
+import com.facebook.presto.orc.metadata.StripeInformation;
+import com.facebook.presto.orc.stream.OrcInputStream;
+import com.facebook.presto.orc.stream.SharedBuffer;
 import com.google.common.base.Functions;
 import com.google.common.collect.AbstractIterator;
 import com.google.common.collect.ImmutableList;
@@ -91,11 +95,14 @@ import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.mapred.JobConf;
+import org.apache.orc.OrcConf;
 import org.joda.time.DateTimeZone;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.math.BigDecimal;
@@ -120,6 +127,10 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static com.facebook.hive.orc.OrcConf.ConfVars.HIVE_ORC_BUILD_STRIDE_DICTIONARY;
+import static com.facebook.hive.orc.OrcConf.ConfVars.HIVE_ORC_COMPRESSION;
+import static com.facebook.hive.orc.OrcConf.ConfVars.HIVE_ORC_DICTIONARY_ENCODING_INTERVAL;
+import static com.facebook.hive.orc.OrcConf.ConfVars.HIVE_ORC_ENTROPY_STRING_THRESHOLD;
 import static com.facebook.presto.common.type.BigintType.BIGINT;
 import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.common.type.Chars.truncateToLengthAndTrimSpaces;
@@ -135,7 +146,10 @@ import static com.facebook.presto.common.type.VarbinaryType.VARBINARY;
 import static com.facebook.presto.common.type.VarcharType.VARCHAR;
 import static com.facebook.presto.common.type.Varchars.truncateToLength;
 import static com.facebook.presto.metadata.FunctionAndTypeManager.createTestFunctionAndTypeManager;
+import static com.facebook.presto.orc.DwrfEncryptionProvider.NO_ENCRYPTION;
 import static com.facebook.presto.orc.NoopOrcAggregatedMemoryContext.NOOP_ORC_AGGREGATED_MEMORY_CONTEXT;
+import static com.facebook.presto.orc.NoopOrcLocalMemoryContext.NOOP_ORC_LOCAL_MEMORY_CONTEXT;
+import static com.facebook.presto.orc.OrcDecompressor.createOrcDecompressor;
 import static com.facebook.presto.orc.OrcReader.MAX_BATCH_SIZE;
 import static com.facebook.presto.orc.OrcTester.Format.DWRF;
 import static com.facebook.presto.orc.OrcTester.Format.ORC_11;
@@ -202,7 +216,6 @@ public class OrcTester
     {
         ORC_12(OrcEncoding.ORC) {
             @Override
-            @SuppressWarnings("deprecation")
             public Serializer createSerializer()
             {
                 return new OrcSerde();
@@ -210,7 +223,6 @@ public class OrcTester
         },
         ORC_11(OrcEncoding.ORC) {
             @Override
-            @SuppressWarnings("deprecation")
             public Serializer createSerializer()
             {
                 return new OrcSerde();
@@ -224,7 +236,6 @@ public class OrcTester
             }
 
             @Override
-            @SuppressWarnings("deprecation")
             public Serializer createSerializer()
             {
                 return new com.facebook.hive.orc.OrcSerde();
@@ -248,7 +259,6 @@ public class OrcTester
             return true;
         }
 
-        @SuppressWarnings("deprecation")
         public abstract Serializer createSerializer();
     }
 
@@ -1448,7 +1458,6 @@ public class OrcTester
                 orcEncoding,
                 orcFileTailSource,
                 stripeMetadataSource,
-                Optional.empty(),
                 NOOP_ORC_AGGREGATED_MEMORY_CONTEXT,
                 new OrcReaderOptions(
                         new DataSize(1, MEGABYTE),
@@ -1506,31 +1515,12 @@ public class OrcTester
     public static void writeOrcColumnsPresto(File outputFile, Format format, CompressionKind compression, Optional<DwrfWriterEncryption> dwrfWriterEncryption, List<Type> types, List<List<?>> values, WriterStats stats)
             throws Exception
     {
-        List<String> columnNames = makeColumnNames(types.size());
-
-        ImmutableMap.Builder<String, String> metadata = ImmutableMap.builder();
-        metadata.put("columns", String.join(", ", columnNames));
-        metadata.put("columns.types", createSettableStructObjectInspector(types).getTypeName());
-
-        OrcWriter writer = new OrcWriter(
-                new OutputStreamDataSink(new FileOutputStream(outputFile)),
-                columnNames,
-                types,
-                format.getOrcEncoding(),
-                compression,
-                dwrfWriterEncryption,
-                new DwrfEncryptionProvider(new UnsupportedEncryptionLibrary(), new TestingEncryptionLibrary()),
-                new OrcWriterOptions(),
-                ImmutableMap.of(),
-                HIVE_STORAGE_TIME_ZONE,
-                true,
-                BOTH,
-                stats);
+        OrcWriter writer = createOrcWriter(outputFile, format.orcEncoding, compression, dwrfWriterEncryption, types, OrcWriterOptions.builder().build(), stats);
 
         Block[] blocks = new Block[types.size()];
         for (int i = 0; i < types.size(); i++) {
             Type type = types.get(i);
-            BlockBuilder blockBuilder = type.createBlockBuilder(null, 1024);
+            BlockBuilder blockBuilder = type.createBlockBuilder(null, values.size());
             for (Object value : values.get(i)) {
                 writeValue(type, blockBuilder, value);
             }
@@ -1545,6 +1535,77 @@ public class OrcTester
                 new DataSize(1, MEGABYTE),
                 new DataSize(1, MEGABYTE),
                 true));
+    }
+
+    public static List<StripeFooter> getStripes(File inputFile, OrcEncoding encoding)
+            throws IOException
+    {
+        boolean zstdJniDecompressionEnabled = true;
+        DataSize dataSize = new DataSize(1, MEGABYTE);
+        OrcDataSource orcDataSource = new FileOrcDataSource(inputFile, dataSize, dataSize, dataSize, true);
+        OrcReader reader = new OrcReader(
+                orcDataSource,
+                encoding,
+                new StorageOrcFileTailSource(),
+                new StorageStripeMetadataSource(),
+                NOOP_ORC_AGGREGATED_MEMORY_CONTEXT,
+                new OrcReaderOptions(
+                        dataSize,
+                        dataSize,
+                        dataSize,
+                        zstdJniDecompressionEnabled),
+                false,
+                NO_ENCRYPTION,
+                DwrfKeyProvider.EMPTY);
+
+        Footer footer = reader.getFooter();
+        Optional<OrcDecompressor> decompressor = createOrcDecompressor(orcDataSource.getId(), reader.getCompressionKind(), reader.getBufferSize(), zstdJniDecompressionEnabled);
+
+        ImmutableList.Builder<StripeFooter> stripes = new ImmutableList.Builder<>();
+        for (StripeInformation stripe : footer.getStripes()) {
+            // read the footer
+            byte[] tailBuffer = new byte[toIntExact(stripe.getFooterLength())];
+            orcDataSource.readFully(stripe.getOffset() + stripe.getIndexLength() + stripe.getDataLength(), tailBuffer);
+            try (InputStream inputStream = new OrcInputStream(
+                    orcDataSource.getId(),
+                    new SharedBuffer(NOOP_ORC_LOCAL_MEMORY_CONTEXT),
+                    Slices.wrappedBuffer(tailBuffer).getInput(),
+                    decompressor,
+                    Optional.empty(),
+                    new TestingHiveOrcAggregatedMemoryContext(),
+                    tailBuffer.length)) {
+                StripeFooter stripeFooter = encoding.createMetadataReader().readStripeFooter(orcDataSource.getId(), footer.getTypes(), inputStream);
+                stripes.add(stripeFooter);
+            }
+        }
+        return stripes.build();
+    }
+
+    public static OrcWriter createOrcWriter(File outputFile, OrcEncoding encoding, CompressionKind compression, Optional<DwrfWriterEncryption> dwrfWriterEncryption, List<Type> types, OrcWriterOptions writerOptions, WriterStats stats)
+            throws FileNotFoundException
+    {
+        List<String> columnNames = makeColumnNames(types.size());
+
+        ImmutableMap.Builder<String, String> metadata = ImmutableMap.builder();
+        metadata.put("columns", String.join(", ", columnNames));
+        metadata.put("columns.types", createSettableStructObjectInspector(types).getTypeName());
+
+        OrcWriter writer = new OrcWriter(
+                new OutputStreamDataSink(new FileOutputStream(outputFile)),
+                columnNames,
+                types,
+                encoding,
+                compression,
+                dwrfWriterEncryption,
+                new DwrfEncryptionProvider(new UnsupportedEncryptionLibrary(), new TestingEncryptionLibrary()),
+                writerOptions,
+                Optional.empty(),
+                ImmutableMap.of(),
+                HIVE_STORAGE_TIME_ZONE,
+                true,
+                BOTH,
+                stats);
+        return writer;
     }
 
     private static DwrfWriterEncryption generateWriterEncryption()
@@ -1619,7 +1680,6 @@ public class OrcTester
                 DwrfKeyProvider.of(intermediateEncryptionKeys));
 
         assertEquals(orcReader.getColumnNames().subList(0, types.size()), makeColumnNames(types.size()));
-        assertEquals(orcReader.getFooter().getRowsInRowGroup(), 10_000);
 
         return orcReader.createSelectiveRecordReader(
                 includedColumns,
@@ -1962,7 +2022,7 @@ public class OrcTester
         Object row = objectInspector.create();
 
         List<StructField> fields = ImmutableList.copyOf(objectInspector.getAllStructFieldRefs());
-        @SuppressWarnings("deprecation") Serializer serializer = format.createSerializer();
+        Serializer serializer = format.createSerializer();
 
         for (int i = 0; i < values.get(0).size(); i++) {
             for (int j = 0; j < types.size(); j++) {
@@ -2204,8 +2264,8 @@ public class OrcTester
             throws IOException
     {
         JobConf jobConf = new JobConf();
-        jobConf.set("hive.exec.orc.write.format", format == ORC_12 ? "0.12" : "0.11");
-        jobConf.set("hive.exec.orc.default.compress", compression.name());
+        OrcConf.WRITE_FORMAT.setString(jobConf, format == ORC_12 ? "0.12" : "0.11");
+        OrcConf.COMPRESS.setString(jobConf, compression.name());
 
         return new OrcOutputFormat().getHiveRecordWriter(
                 jobConf,
@@ -2220,11 +2280,10 @@ public class OrcTester
             throws IOException
     {
         JobConf jobConf = new JobConf();
-        jobConf.set("hive.exec.orc.default.compress", compressionCodec.name());
-        jobConf.set("hive.exec.orc.compress", compressionCodec.name());
-        OrcConf.setIntVar(jobConf, OrcConf.ConfVars.HIVE_ORC_ENTROPY_STRING_THRESHOLD, 1);
-        OrcConf.setIntVar(jobConf, OrcConf.ConfVars.HIVE_ORC_DICTIONARY_ENCODING_INTERVAL, 2);
-        OrcConf.setBoolVar(jobConf, OrcConf.ConfVars.HIVE_ORC_BUILD_STRIDE_DICTIONARY, true);
+        com.facebook.hive.orc.OrcConf.setVar(jobConf, HIVE_ORC_COMPRESSION, compressionCodec.name());
+        com.facebook.hive.orc.OrcConf.setIntVar(jobConf, HIVE_ORC_ENTROPY_STRING_THRESHOLD, 1);
+        com.facebook.hive.orc.OrcConf.setIntVar(jobConf, HIVE_ORC_DICTIONARY_ENCODING_INTERVAL, 2);
+        com.facebook.hive.orc.OrcConf.setBoolVar(jobConf, HIVE_ORC_BUILD_STRIDE_DICTIONARY, true);
 
         return new com.facebook.hive.orc.OrcOutputFormat().getHiveRecordWriter(
                 jobConf,
@@ -2254,12 +2313,12 @@ public class OrcTester
         String columnTypes = types.stream()
                 .map(OrcTester::getJavaObjectInspector)
                 .map(ObjectInspector::getTypeName)
-                .collect(Collectors.joining(", "));
+                .collect(Collectors.joining(","));
 
         Properties orderTableProperties = new Properties();
-        orderTableProperties.setProperty("columns", String.join(", ", makeColumnNames(types.size())));
+        orderTableProperties.setProperty("columns", String.join(",", makeColumnNames(types.size())));
         orderTableProperties.setProperty("columns.types", columnTypes);
-        orderTableProperties.setProperty("orc.bloom.filter.columns", String.join(", ", makeColumnNames(types.size())));
+        orderTableProperties.setProperty("orc.bloom.filter.columns", String.join(",", makeColumnNames(types.size())));
         orderTableProperties.setProperty("orc.bloom.filter.fpp", "0.50");
         orderTableProperties.setProperty("orc.bloom.filter.write.version", "original");
         return orderTableProperties;

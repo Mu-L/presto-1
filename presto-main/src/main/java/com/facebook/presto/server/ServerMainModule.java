@@ -16,10 +16,11 @@ package com.facebook.presto.server;
 import com.facebook.airlift.concurrent.BoundedExecutor;
 import com.facebook.airlift.configuration.AbstractConfigurationAwareModule;
 import com.facebook.airlift.http.server.TheServlet;
-import com.facebook.airlift.json.ObjectMapperProvider;
+import com.facebook.airlift.json.JsonObjectMapperProvider;
 import com.facebook.airlift.stats.GcMonitor;
 import com.facebook.airlift.stats.JmxGcMonitor;
 import com.facebook.airlift.stats.PauseMeter;
+import com.facebook.drift.client.ExceptionClassification;
 import com.facebook.drift.client.address.AddressSelector;
 import com.facebook.drift.codec.utils.DefaultThriftCodecsModule;
 import com.facebook.drift.transport.netty.client.DriftNettyClientModule;
@@ -56,6 +57,7 @@ import com.facebook.presto.execution.TaskManager;
 import com.facebook.presto.execution.TaskManagerConfig;
 import com.facebook.presto.execution.TaskStatus;
 import com.facebook.presto.execution.TaskThresholdMemoryRevokingScheduler;
+import com.facebook.presto.execution.buffer.SpoolingOutputBufferFactory;
 import com.facebook.presto.execution.executor.MultilevelSplitQueue;
 import com.facebook.presto.execution.executor.TaskExecutor;
 import com.facebook.presto.execution.scheduler.FlatNetworkTopology;
@@ -107,7 +109,19 @@ import com.facebook.presto.operator.NoOpFragmentResultCacheManager;
 import com.facebook.presto.operator.OperatorStats;
 import com.facebook.presto.operator.PagesIndex;
 import com.facebook.presto.operator.TableCommitContext;
+import com.facebook.presto.operator.TaskMemoryReservationSummary;
 import com.facebook.presto.operator.index.IndexJoinLookupStats;
+import com.facebook.presto.resourcemanager.ClusterMemoryManagerService;
+import com.facebook.presto.resourcemanager.ClusterStatusSender;
+import com.facebook.presto.resourcemanager.ForResourceManager;
+import com.facebook.presto.resourcemanager.NoopResourceGroupService;
+import com.facebook.presto.resourcemanager.RandomResourceManagerAddressSelector;
+import com.facebook.presto.resourcemanager.ResourceGroupService;
+import com.facebook.presto.resourcemanager.ResourceManagerClient;
+import com.facebook.presto.resourcemanager.ResourceManagerClusterStatusSender;
+import com.facebook.presto.resourcemanager.ResourceManagerConfig;
+import com.facebook.presto.resourcemanager.ResourceManagerInconsistentException;
+import com.facebook.presto.resourcemanager.ResourceManagerResourceGroupService;
 import com.facebook.presto.server.remotetask.HttpLocationFactory;
 import com.facebook.presto.server.thrift.FixedAddressSelector;
 import com.facebook.presto.server.thrift.ThriftServerInfoClient;
@@ -117,6 +131,7 @@ import com.facebook.presto.server.thrift.ThriftTaskService;
 import com.facebook.presto.spi.ConnectorSplit;
 import com.facebook.presto.spi.PageIndexerFactory;
 import com.facebook.presto.spi.PageSorter;
+import com.facebook.presto.spi.function.SqlInvokedFunction;
 import com.facebook.presto.spi.relation.DeterminismEvaluator;
 import com.facebook.presto.spi.relation.DomainTranslator;
 import com.facebook.presto.spi.relation.PredicateCompiler;
@@ -171,8 +186,11 @@ import com.facebook.presto.util.GcStatusMonitor;
 import com.facebook.presto.version.EmbedVersion;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.ListeningExecutorService;
 import com.google.inject.Binder;
+import com.google.inject.Inject;
 import com.google.inject.Key;
+import com.google.inject.Module;
 import com.google.inject.Provides;
 import com.google.inject.Scopes;
 import io.airlift.slice.Slice;
@@ -180,13 +198,15 @@ import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 
 import javax.annotation.PreDestroy;
-import javax.inject.Inject;
 import javax.inject.Singleton;
 import javax.servlet.Servlet;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadPoolExecutor;
 
 import static com.facebook.airlift.concurrent.ConcurrentScheduledExecutor.createConcurrentScheduledExecutor;
 import static com.facebook.airlift.concurrent.Threads.daemonThreadsNamed;
@@ -197,15 +217,17 @@ import static com.facebook.airlift.http.client.HttpClientBinder.httpClientBinder
 import static com.facebook.airlift.jaxrs.JaxrsBinder.jaxrsBinder;
 import static com.facebook.airlift.json.JsonBinder.jsonBinder;
 import static com.facebook.airlift.json.JsonCodecBinder.jsonCodecBinder;
+import static com.facebook.airlift.json.smile.SmileCodecBinder.smileCodecBinder;
+import static com.facebook.drift.client.ExceptionClassification.HostStatus.DOWN;
+import static com.facebook.drift.client.ExceptionClassification.HostStatus.NORMAL;
 import static com.facebook.drift.client.guice.DriftClientBinder.driftClientBinder;
 import static com.facebook.drift.codec.guice.ThriftCodecBinder.thriftCodecBinder;
 import static com.facebook.drift.server.guice.DriftServerBinder.driftServerBinder;
 import static com.facebook.presto.execution.scheduler.NodeSchedulerConfig.NetworkTopologyType.FLAT;
 import static com.facebook.presto.execution.scheduler.NodeSchedulerConfig.NetworkTopologyType.LEGACY;
-import static com.facebook.presto.server.smile.SmileCodecBinder.smileCodecBinder;
-import static com.facebook.presto.sql.analyzer.FeaturesConfig.TaskSpillingStrategy.PER_TASK_MEMORY_THRESHOLD;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Strings.nullToEmpty;
+import static com.google.common.util.concurrent.MoreExecutors.listeningDecorator;
 import static com.google.inject.multibindings.MapBinder.newMapBinder;
 import static com.google.inject.multibindings.Multibinder.newSetBinder;
 import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
@@ -324,17 +346,81 @@ public class ServerMainModule
         jaxrsBinder(binder).bind(TaskExecutorResource.class);
         newExporter(binder).export(TaskExecutorResource.class).withGeneratedName();
         binder.bind(TaskManagementExecutor.class).in(Scopes.SINGLETON);
-        binder.bind(SqlTaskManager.class).in(Scopes.SINGLETON);
-        binder.bind(TaskManager.class).to(Key.get(SqlTaskManager.class));
 
         install(new DefaultThriftCodecsModule());
+        thriftCodecBinder(binder).bindCustomThriftCodec(SqlInvokedFunctionCodec.class);
+        thriftCodecBinder(binder).bindCustomThriftCodec(SqlFunctionIdCodec.class);
 
-        // memory revoking scheduler
+        jsonCodecBinder(binder).bindListJsonCodec(TaskMemoryReservationSummary.class);
+        binder.bind(SqlTaskManager.class).in(Scopes.SINGLETON);
+        binder.bind(TaskManager.class).to(Key.get(SqlTaskManager.class));
+        binder.bind(SpoolingOutputBufferFactory.class).in(Scopes.SINGLETON);
+
+        binder.bind(RandomResourceManagerAddressSelector.class).in(Scopes.SINGLETON);
+        driftClientBinder(binder)
+                .bindDriftClient(ResourceManagerClient.class, ForResourceManager.class)
+                .withAddressSelector((addressSelectorBinder, annotation, prefix) ->
+                        addressSelectorBinder.bind(AddressSelector.class).annotatedWith(annotation).to(RandomResourceManagerAddressSelector.class))
+                .withExceptionClassifier(throwable -> {
+                    if (throwable instanceof ResourceManagerInconsistentException) {
+                        return new ExceptionClassification(Optional.of(true), DOWN);
+                    }
+                    return new ExceptionClassification(Optional.of(true), NORMAL);
+                });
+        newOptionalBinder(binder, ClusterMemoryManagerService.class);
         install(installModuleIf(
-                FeaturesConfig.class,
-                config -> config.getTaskSpillingStrategy() == PER_TASK_MEMORY_THRESHOLD,
-                moduleBinder -> moduleBinder.bind(TaskThresholdMemoryRevokingScheduler.class).in(Scopes.SINGLETON),
-                moduleBinder -> moduleBinder.bind(MemoryRevokingScheduler.class).in(Scopes.SINGLETON)));
+                ServerConfig.class,
+                ServerConfig::isResourceManagerEnabled,
+                new Module()
+                {
+                    @Override
+                    public void configure(Binder moduleBinder)
+                    {
+                        configBinder(moduleBinder).bindConfig(ResourceManagerConfig.class);
+                        moduleBinder.bind(ClusterStatusSender.class).to(ResourceManagerClusterStatusSender.class).in(Scopes.SINGLETON);
+                        if (serverConfig.isCoordinator()) {
+                            moduleBinder.bind(ClusterMemoryManagerService.class).in(Scopes.SINGLETON);
+                            moduleBinder.bind(ResourceGroupService.class).to(ResourceManagerResourceGroupService.class).in(Scopes.SINGLETON);
+                        }
+                    }
+
+                    @Provides
+                    @Singleton
+                    @ForResourceManager
+                    public ScheduledExecutorService createResourceManagerScheduledExecutor(ResourceManagerConfig config)
+                    {
+                        return createConcurrentScheduledExecutor("resource-manager-heartbeats", config.getHeartbeatConcurrency(), config.getHeartbeatThreads());
+                    }
+
+                    @Provides
+                    @Singleton
+                    @ForResourceManager
+                    public ListeningExecutorService createResourceManagerExecutor(ResourceManagerConfig config)
+                    {
+                        ExecutorService executor = new ThreadPoolExecutor(
+                                0,
+                                config.getResourceManagerExecutorThreads(),
+                                60,
+                                SECONDS,
+                                new LinkedBlockingQueue<>(),
+                                daemonThreadsNamed("resource-manager-executor-%s"));
+                        return listeningDecorator(executor);
+                    }
+                },
+                moduleBinder -> {
+                    moduleBinder.bind(ClusterStatusSender.class).toInstance(execution -> {});
+                    moduleBinder.bind(ResourceGroupService.class).to(NoopResourceGroupService.class).in(Scopes.SINGLETON);
+                }));
+
+        FeaturesConfig featuresConfig = buildConfigObject(FeaturesConfig.class);
+        FeaturesConfig.TaskSpillingStrategy taskSpillingStrategy = featuresConfig.getTaskSpillingStrategy();
+        switch (taskSpillingStrategy) {
+            case PER_TASK_MEMORY_THRESHOLD:
+                binder.bind(TaskThresholdMemoryRevokingScheduler.class).in(Scopes.SINGLETON);
+                break;
+            default:
+                binder.bind(MemoryRevokingScheduler.class).in(Scopes.SINGLETON);
+        }
 
         // Add monitoring for JVM pauses
         binder.bind(PauseMeter.class).in(Scopes.SINGLETON);
@@ -381,6 +467,7 @@ public class ServerMainModule
         jsonCodecBinder(binder).bindJsonCodec(OperatorStats.class);
         jsonCodecBinder(binder).bindJsonCodec(ExecutionFailureInfo.class);
         jsonCodecBinder(binder).bindJsonCodec(TableCommitContext.class);
+        jsonCodecBinder(binder).bindJsonCodec(SqlInvokedFunction.class);
         smileCodecBinder(binder).bindSmileCodec(TaskStatus.class);
         smileCodecBinder(binder).bindSmileCodec(TaskInfo.class);
         thriftCodecBinder(binder).bindThriftCodec(TaskStatus.class);
@@ -470,7 +557,7 @@ public class ServerMainModule
 
         // handle resolver
         binder.install(new HandleJsonModule());
-        binder.bind(ObjectMapper.class).toProvider(ObjectMapperProvider.class);
+        binder.bind(ObjectMapper.class).toProvider(JsonObjectMapperProvider.class);
 
         // connector
         binder.bind(ScalarStatsCalculator.class).in(Scopes.SINGLETON);
@@ -638,6 +725,12 @@ public class ServerMainModule
     public static class ExecutorCleanup
     {
         private final List<ExecutorService> executors;
+        @Inject(optional = true)
+        @ForResourceManager
+        private ScheduledExecutorService resourceManagerScheduledExecutor;
+        @Inject(optional = true)
+        @ForResourceManager
+        private ListeningExecutorService resourceManagerExecutor;
 
         @Inject
         public ExecutorCleanup(
@@ -655,6 +748,12 @@ public class ServerMainModule
         public void shutdown()
         {
             executors.forEach(ExecutorService::shutdownNow);
+            if (resourceManagerScheduledExecutor != null) {
+                resourceManagerScheduledExecutor.shutdownNow();
+            }
+            if (resourceManagerExecutor != null) {
+                resourceManagerExecutor.shutdownNow();
+            }
         }
     }
 }

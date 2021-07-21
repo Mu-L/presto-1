@@ -161,7 +161,7 @@ public class HiveClientConfig
     private String temporaryTableSchema = "default";
     private HiveStorageFormat temporaryTableStorageFormat = ORC;
     private HiveCompressionCodec temporaryTableCompressionCodec = HiveCompressionCodec.SNAPPY;
-    private boolean shouldCreateEmptyBucketFilesForTemporaryTable = true;
+    private boolean shouldCreateEmptyBucketFilesForTemporaryTable;
     private boolean usePageFileForHiveUnsupportedType = true;
 
     private boolean pushdownFilterEnabled;
@@ -186,6 +186,9 @@ public class HiveClientConfig
     private boolean fileRenamingEnabled;
     private boolean preferManifestToListFiles;
     private boolean manifestVerificationEnabled;
+    private boolean undoMetastoreOperationsEnabled = true;
+
+    private boolean optimizedPartitionUpdateSerializationEnabled;
 
     public int getMaxInitialSplits()
     {
@@ -1579,5 +1582,31 @@ public class HiveClientConfig
     public boolean isManifestVerificationEnabled()
     {
         return this.manifestVerificationEnabled;
+    }
+
+    @Config("hive.undo-metastore-operations-enabled")
+    @ConfigDescription("Enable undo metastore operations")
+    public HiveClientConfig setUndoMetastoreOperationsEnabled(boolean undoMetastoreOperationsEnabled)
+    {
+        this.undoMetastoreOperationsEnabled = undoMetastoreOperationsEnabled;
+        return this;
+    }
+
+    public boolean isUndoMetastoreOperationsEnabled()
+    {
+        return undoMetastoreOperationsEnabled;
+    }
+
+    public boolean isOptimizedPartitionUpdateSerializationEnabled()
+    {
+        return optimizedPartitionUpdateSerializationEnabled;
+    }
+
+    @Config("hive.experimental-optimized-partition-update-serialization-enabled")
+    @ConfigDescription("Serialize PartitionUpdate objects using binary SMILE encoding and compress with the ZSTD compression")
+    public HiveClientConfig setOptimizedPartitionUpdateSerializationEnabled(boolean optimizedPartitionUpdateSerializationEnabled)
+    {
+        this.optimizedPartitionUpdateSerializationEnabled = optimizedPartitionUpdateSerializationEnabled;
+        return this;
     }
 }
