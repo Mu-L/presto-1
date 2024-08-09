@@ -198,6 +198,8 @@ Property Name                                      Description                  
 
 ``hive.skip-empty-files``                          Enable skipping empty files. Otherwise, it will produce an   ``false``
                                                    error iterating through empty files.
+
+ ``hive.file-status-cache.max-retained-size``      Maximum size in bytes of the directory listing cache          ``0KB``
 ================================================== ============================================================ ============
 
 Metastore Configuration Properties
@@ -912,7 +914,7 @@ Parquet Writer Version
 
 Presto now supports Parquet writer versions V1 and V2 for the Hive catalog.
 It can be toggled using the session property ``parquet_writer_version`` and the config property ``hive.parquet.writer.version``.
-Valid values for these properties are ``PARQUET_1_0`` and ``PARQUET_2_0``. Default is ``PARQUET_2_0``.
+Valid values for these properties are ``PARQUET_1_0`` and ``PARQUET_2_0``. Default is ``PARQUET_1_0``.
 
 Procedures
 ----------

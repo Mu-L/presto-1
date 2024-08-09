@@ -119,6 +119,14 @@ bool isCacheTtlEnabled() {
   return false;
 }
 
+bool isCachePeriodicFullPersistenceEnabled() {
+  const auto* systemConfig = SystemConfig::instance();
+  return systemConfig->asyncDataCacheEnabled() &&
+      systemConfig->asyncCacheSsdGb() > 0 &&
+      systemConfig->asyncCacheFullPersistenceInterval() >
+      std::chrono::seconds::zero();
+}
+
 } // namespace
 
 std::string nodeState2String(NodeState nodeState) {
@@ -163,10 +171,6 @@ void PrestoServer::run() {
     // velox.properties is optional.
     baseVeloxQueryConfig->initialize(
         fmt::format("{}/velox.properties", configDirectoryPath_), true);
-
-    if (systemConfig->enableRuntimeMetricsCollection()) {
-      enableRuntimeMetricReporting();
-    }
 
     httpPort = systemConfig->httpServerHttpPort();
     if (systemConfig->httpServerHttpsEnabled()) {
@@ -372,6 +376,21 @@ void PrestoServer::run() {
             .sendWithEOM();
       });
 
+  if (systemConfig->enableRuntimeMetricsCollection()) {
+    enableWorkerStatsReporting();
+    if (folly::Singleton<velox::BaseStatsReporter>::try_get()) {
+      httpServer_->registerGet(
+          "/v1/info/metrics",
+          [](proxygen::HTTPMessage* /*message*/,
+             const std::vector<std::unique_ptr<folly::IOBuf>>& /*body*/,
+             proxygen::ResponseHandler* downstream) {
+            http::sendOkResponse(
+                downstream,
+                folly::Singleton<velox::BaseStatsReporter>::try_get()
+                    ->fetchMetrics());
+          });
+    }
+  }
   registerFunctions();
   registerRemoteFunctions();
   registerVectorSerdes();
@@ -563,7 +582,7 @@ void PrestoServer::run() {
       << driverExecutor_->numThreads()
       << ", task queue: " << driverExecutor_->getTaskQueueSize();
   // Schedule release of SessionPools held by HttpClients before the exchange
-  // HTTP executor threads are joined.
+  // HTTP IO executor threads are joined.
   driverExecutor_.reset();
 
   if (connectorIoExecutor_) {
@@ -572,11 +591,6 @@ void PrestoServer::run() {
         << "': threads: " << connectorIoExecutor_->numActiveThreads() << "/"
         << connectorIoExecutor_->numThreads();
     connectorIoExecutor_->join();
-  }
-
-  if (exchangeSourceConnectionPool_) {
-    PRESTO_SHUTDOWN_LOG(INFO) << "Releasing exchange HTTP connection pools";
-    exchangeSourceConnectionPool_->destroy();
   }
 
   if (httpSrvCpuExecutor_ != nullptr) {
@@ -597,18 +611,28 @@ void PrestoServer::run() {
   }
 
   PRESTO_SHUTDOWN_LOG(INFO)
-      << "Joining Exchange Http IO executor '"
-      << exchangeHttpIoExecutor_->getName()
-      << "': threads: " << exchangeHttpIoExecutor_->numActiveThreads() << "/"
-      << exchangeHttpIoExecutor_->numThreads();
-  exchangeHttpIoExecutor_->join();
-
-  PRESTO_SHUTDOWN_LOG(INFO)
       << "Joining Exchange Http CPU executor '"
       << exchangeHttpCpuExecutor_->getName()
       << "': threads: " << exchangeHttpCpuExecutor_->numActiveThreads() << "/"
       << exchangeHttpCpuExecutor_->numThreads();
   exchangeHttpCpuExecutor_->join();
+  // Schedule release of SessionPools held by HttpClients before the exchange
+  // HTTP IO executor threads are joined.
+  exchangeHttpCpuExecutor_.reset();
+
+  if (exchangeSourceConnectionPool_) {
+    // Connection pool needs to be destroyed after CPU threads are joined but
+    // before IO threads are joined.
+    PRESTO_SHUTDOWN_LOG(INFO) << "Releasing exchange HTTP connection pools";
+    exchangeSourceConnectionPool_->destroy();
+  }
+
+  PRESTO_SHUTDOWN_LOG(INFO)
+      << "Joining Exchange Http IO executor '"
+      << exchangeHttpIoExecutor_->getName()
+      << "': threads: " << exchangeHttpIoExecutor_->numActiveThreads() << "/"
+      << exchangeHttpIoExecutor_->numThreads();
+  exchangeHttpIoExecutor_->join();
 
   PRESTO_SHUTDOWN_LOG(INFO) << "Done joining our executors.";
 
@@ -787,8 +811,13 @@ void PrestoServer::initializeVeloxMemory() {
     std::unique_ptr<cache::SsdCache> ssd = setupSsdCache();
     std::string cacheStr =
         ssd == nullptr ? "AsyncDataCache" : "AsyncDataCache with SSD";
+
+    cache::AsyncDataCache::Options cacheOptions{
+        systemConfig->asyncCacheMaxSsdWriteRatio(),
+        systemConfig->asyncCacheSsdSavableRatio(),
+        systemConfig->asyncCacheMinSsdSavableBytes()};
     cache_ = cache::AsyncDataCache::create(
-        memory::memoryManager()->allocator(), std::move(ssd));
+        memory::memoryManager()->allocator(), std::move(ssd), cacheOptions);
     cache::AsyncDataCache::setInstance(cache_.get());
     PRESTO_STARTUP_LOG(INFO) << cacheStr << " has been setup";
 
@@ -928,6 +957,49 @@ void PrestoServer::addServerPeriodicTasks() {
         },
         ttlCheckInterval,
         "cache_ttl");
+  }
+
+  if (isCachePeriodicFullPersistenceEnabled()) {
+    PRESTO_STARTUP_LOG(INFO)
+        << "Initializing cache periodic full persistence task...";
+    auto* cache = velox::cache::AsyncDataCache::getInstance();
+    VELOX_CHECK_NOT_NULL(cache);
+    auto* ssdCache = cache->ssdCache();
+    VELOX_CHECK_NOT_NULL(ssdCache);
+    const auto* systemConfig = SystemConfig::instance();
+    const int64_t cacheFullPersistenceIntervalUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            systemConfig->asyncCacheFullPersistenceInterval())
+            .count();
+    const auto asyncCacheSsdCheckpointGb =
+        systemConfig->asyncCacheSsdCheckpointGb();
+    periodicTaskManager_->addTask(
+        [asyncCacheSsdCheckpointGb, cache, ssdCache]() {
+          try {
+            if (!ssdCache->startWrite()) {
+              return;
+            }
+            LOG(INFO) << "Persisting full cache to SSD...";
+            cache->saveToSsd(true);
+            ssdCache->waitForWriteToFinish();
+            LOG(INFO) << "Cache full persistence completed.";
+
+            if (asyncCacheSsdCheckpointGb == 0) {
+              return;
+            }
+
+            if (!ssdCache->startWrite()) {
+              return;
+            }
+
+            ssdCache->checkpoint();
+            ssdCache->waitForWriteToFinish();
+          } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to persistent cache to SSD: " << e.what();
+          }
+        },
+        cacheFullPersistenceIntervalUs,
+        "cache_full_persistence");
   }
 }
 
@@ -1171,7 +1243,7 @@ std::string PrestoServer::getBaseSpillDirectory() const {
   return SystemConfig::instance()->spillerSpillPath().value_or("");
 }
 
-void PrestoServer::enableRuntimeMetricReporting() {
+void PrestoServer::enableWorkerStatsReporting() {
   // This flag must be set to register the counters.
   facebook::velox::BaseStatsReporter::registered = true;
   registerStatsCounters();

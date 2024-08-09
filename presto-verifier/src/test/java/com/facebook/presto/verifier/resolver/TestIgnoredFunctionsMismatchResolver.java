@@ -45,7 +45,10 @@ public class TestIgnoredFunctionsMismatchResolver
     @Test
     public void testDefault()
     {
-        ColumnMatchResult<?> mismatchedColumn = createMismatchedColumn(VARCHAR, new SimpleColumnChecksum(binary(0xa)), new SimpleColumnChecksum(binary(0xb)));
+        ColumnMatchResult<?> mismatchedColumn = createMismatchedColumn(
+                VARCHAR,
+                new SimpleColumnChecksum(binary(0xa), Optional.empty()),
+                new SimpleColumnChecksum(binary(0xb), Optional.empty()));
 
         // resolved
         assertResolved(createBundle("CREATE TABLE test AS SELECT rand() x FROM source"), mismatchedColumn);
@@ -68,6 +71,7 @@ public class TestIgnoredFunctionsMismatchResolver
                 sqlParser.createStatement(query, PARSING_OPTIONS),
                 ImmutableList.of(),
                 CONTROL,
+                Optional.empty(),
                 Optional.empty(),
                 false);
     }

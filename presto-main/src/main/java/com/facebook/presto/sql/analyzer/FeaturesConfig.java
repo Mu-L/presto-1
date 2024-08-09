@@ -106,6 +106,7 @@ public class FeaturesConfig
     private Duration historyBasedOptimizerTimeout = new Duration(10, SECONDS);
     private String historyBasedOptimizerPlanCanonicalizationStrategies = "IGNORE_SAFE_CONSTANTS";
     private boolean logPlansUsedInHistoryBasedOptimizer;
+    private boolean enforceTimeoutForHBOQueryRegistration;
     private boolean redistributeWrites = true;
     private boolean scaleWriters;
     private DataSize writerMinSize = new DataSize(32, MEGABYTE);
@@ -217,6 +218,9 @@ public class FeaturesConfig
     private boolean preferDistributedUnion = true;
     private boolean optimizeNullsInJoin;
     private boolean optimizePayloadJoins;
+    private boolean confidenceBasedBroadcastEnabled;
+    private boolean retryQueryWithHistoryBasedOptimizationEnabled;
+    private boolean treatLowConfidenceZeroEstimationAsUnknownEnabled;
     private boolean pushdownDereferenceEnabled;
     private boolean inlineSqlFunctions = true;
     private boolean checkAccessControlOnUtilizedColumnsOnly;
@@ -261,6 +265,7 @@ public class FeaturesConfig
     private boolean pushRemoteExchangeThroughGroupId;
     private boolean isOptimizeMultipleApproxPercentileOnSameFieldEnabled = true;
     private boolean nativeExecutionEnabled;
+    private boolean disableTimeStampWithTimeZoneForNative = true;
     private String nativeExecutionExecutablePath = "./presto_server";
     private String nativeExecutionProgramArguments = "";
     private boolean nativeExecutionProcessReuseEnabled = true;
@@ -308,6 +313,7 @@ public class FeaturesConfig
     private boolean limitNumberOfGroupsForKHyperLogLogAggregations = true;
     private boolean generateDomainFilters;
     private boolean printEstimatedStatsFromCache;
+    private boolean removeCrossJoinWithSingleConstantRow = true;
     private CreateView.Security defaultViewSecurityMode = DEFINER;
     private boolean useHistograms;
 
@@ -1005,6 +1011,18 @@ public class FeaturesConfig
         return this;
     }
 
+    public boolean isEnforceTimeoutForHBOQueryRegistration()
+    {
+        return enforceTimeoutForHBOQueryRegistration;
+    }
+
+    @Config("optimizer.enforce-timeout-for-hbo-query-registration")
+    public FeaturesConfig setEnforceTimeoutForHBOQueryRegistration(boolean enforceTimeoutForHBOQueryRegistration)
+    {
+        this.enforceTimeoutForHBOQueryRegistration = enforceTimeoutForHBOQueryRegistration;
+        return this;
+    }
+
     public AggregationPartitioningMergingStrategy getAggregationPartitioningMergingStrategy()
     {
         return aggregationPartitioningMergingStrategy;
@@ -1247,6 +1265,42 @@ public class FeaturesConfig
     public FeaturesConfig setDictionaryAggregation(boolean dictionaryAggregation)
     {
         this.dictionaryAggregation = dictionaryAggregation;
+        return this;
+    }
+
+    public boolean isConfidenceBasedBroadcastEnabled()
+    {
+        return confidenceBasedBroadcastEnabled;
+    }
+
+    @Config("optimizer.confidence-based-broadcast")
+    public FeaturesConfig setConfidenceBasedBroadcastEnabled(boolean confidenceBasedBroadcastEnabled)
+    {
+        this.confidenceBasedBroadcastEnabled = confidenceBasedBroadcastEnabled;
+        return this;
+    }
+
+    public boolean isRetryQueryWithHistoryBasedOptimizationEnabled()
+    {
+        return retryQueryWithHistoryBasedOptimizationEnabled;
+    }
+
+    @Config("optimizer.retry-query-with-history-based-optimization")
+    public FeaturesConfig setRetryQueryWithHistoryBasedOptimizationEnabled(boolean retryQueryWithHistoryBasedOptimizationEnabled)
+    {
+        this.retryQueryWithHistoryBasedOptimizationEnabled = retryQueryWithHistoryBasedOptimizationEnabled;
+        return this;
+    }
+
+    public boolean isTreatLowConfidenceZeroEstimationAsUnknownEnabled()
+    {
+        return treatLowConfidenceZeroEstimationAsUnknownEnabled;
+    }
+
+    @Config("optimizer.treat-low-confidence-zero-estimation-as-unknown")
+    public FeaturesConfig setTreatLowConfidenceZeroEstimationAsUnknownEnabled(boolean treatLowConfidenceZeroEstimationAsUnknownEnabled)
+    {
+        this.treatLowConfidenceZeroEstimationAsUnknownEnabled = treatLowConfidenceZeroEstimationAsUnknownEnabled;
         return this;
     }
 
@@ -2588,6 +2642,19 @@ public class FeaturesConfig
         return this.nativeExecutionEnabled;
     }
 
+    @Config("disable-timestamp-with-timezone-for-native-execution")
+    @ConfigDescription("Disable timestamp with timezone type on native engine")
+    public FeaturesConfig setDisableTimeStampWithTimeZoneForNative(boolean disableTimeStampWithTimeZoneForNative)
+    {
+        this.disableTimeStampWithTimeZoneForNative = disableTimeStampWithTimeZoneForNative;
+        return this;
+    }
+
+    public boolean isDisableTimeStampWithTimeZoneForNative()
+    {
+        return this.disableTimeStampWithTimeZoneForNative;
+    }
+
     @Config("native-execution-executable-path")
     @ConfigDescription("Native execution executable file path")
     public FeaturesConfig setNativeExecutionExecutablePath(String nativeExecutionExecutablePath)
@@ -3105,6 +3172,19 @@ public class FeaturesConfig
     public FeaturesConfig setPrintEstimatedStatsFromCache(boolean printEstimatedStatsFromCache)
     {
         this.printEstimatedStatsFromCache = printEstimatedStatsFromCache;
+        return this;
+    }
+
+    public boolean isRemoveCrossJoinWithSingleConstantRow()
+    {
+        return this.removeCrossJoinWithSingleConstantRow;
+    }
+
+    @Config("optimizer.remove-cross-join-with-single-constant-row")
+    @ConfigDescription("If one input of the cross join is a single row with constant value, remove this cross join and replace with a project node")
+    public FeaturesConfig setRemoveCrossJoinWithSingleConstantRow(boolean removeCrossJoinWithSingleConstantRow)
+    {
+        this.removeCrossJoinWithSingleConstantRow = removeCrossJoinWithSingleConstantRow;
         return this;
     }
 
